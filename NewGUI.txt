@@ -1,0 +1,1 @@
+Make a copy of simulation_gui.py that adds some features. It will be a window with 5 buttons as options. They will be a list of completed jobs, an "add order" button, a "create schedule" button, a "simulate" button that goes to what the GUI currently displays (add a back button), and a "breakdowns" button that controls which machines are working. 
