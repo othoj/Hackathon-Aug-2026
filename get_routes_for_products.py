@@ -5,9 +5,13 @@ from typing import TypedDict
 
 import pandas as pd
 
-EXCEL_PATH = Path(
-    "/home/otho/Desktop/Repositories/SMT2020/SMT_2020 - Final/General Data/dataset 4/"
-    "SMT_2020_Model_Data_-_LVHM_E.xlsx"
+EXCEL_PATH = (
+    Path(__file__).resolve().parent
+    / "SMT2020"
+    / "SMT_2020 - Final"
+    / "General Data"
+    / "dataset 4"
+    / "SMT_2020_Model_Data_-_LVHM_E.xlsx"
 )
 
 PROCESSING_UNIT_MULTIPLIERS = {
