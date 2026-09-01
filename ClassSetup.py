@@ -664,6 +664,86 @@ class Simulation:
             affected_tool_groups.add(next_step.tool_group_needed)
         return affected_tool_groups
 
+    @property
+    def is_finished(self) -> bool:
+        """Whether every batch in the simulation has completed."""
+        return self.completed_batches == self.total_batches
+
+    @property
+    def busy_machine_count(self) -> int:
+        """Number of machines currently processing a batch."""
+        return len(self._busy)
+
+    @property
+    def waiting_batch_count(self) -> int:
+        """Number of released batches waiting for a machine."""
+        return sum(len(batches) for batches in self._ready.values())
+
+    @property
+    def unreleased_batch_count(self) -> int:
+        """Number of batches whose scheduled release time has not arrived."""
+        return len(self._releases)
+
+    @property
+    def idle_machine_count(self) -> int:
+        """Number of machines immediately available for work."""
+        return sum(len(machines) for machines in self._open_machines.values())
+
+    def tool_group_activity(self) -> dict[str, tuple[int, int, int]]:
+        """Return idle-machine, busy-machine, and waiting-batch counts by group."""
+        busy_by_group = {group_id: 0 for group_id in self.tool_groups}
+        for _, _, machine in self._busy:
+            busy_by_group[machine.tool_group.id] += 1
+        return {
+            group_id: (
+                len(self._open_machines[group_id]),
+                busy_by_group[group_id],
+                len(self._ready[group_id]),
+            )
+            for group_id in self.tool_groups
+        }
+
+    def advance(self, minutes: float) -> float:
+        """Advance the simulation by up to ``minutes`` of simulated time.
+
+        Events are still processed in chronological order.  This lets an
+        interface animate the event-driven simulation without changing its
+        scheduling rules.
+        """
+        if minutes < 0:
+            raise ValueError("minutes must be non-negative")
+
+        target_time = self.global_timer + float(minutes)
+        while self._busy or self._releases:
+            next_completion = self._busy[0][0] if self._busy else float("inf")
+            next_release = (
+                self._releases[0][0] if self._releases else float("inf")
+            )
+            next_event_time = min(next_completion, next_release)
+            if next_event_time > target_time:
+                break
+
+            self.global_timer = next_event_time
+            affected_tool_groups = self._release_lots()
+            while self._busy and self._busy[0][0] <= self.global_timer:
+                _, _, machine = heappop(self._busy)
+                affected_tool_groups.update(self._complete_machine(machine))
+            for tool_group_id in affected_tool_groups:
+                self._dispatch(tool_group_id)
+
+        # Preserve the time at the final completion event instead of advancing
+        # past the end of the simulation.
+        if self._busy or self._releases:
+            self.global_timer = target_time
+        elif not self.is_finished:
+            blocked = {
+                group_id: len(batches)
+                for group_id, batches in self._ready.items()
+                if batches
+            }
+            raise RuntimeError(f"Simulation stopped with blocked batches: {blocked}")
+        return self.global_timer
+
     def run(self) -> float:
         """Release scheduled lots, drain them, and return elapsed minutes."""
         while self._busy or self._releases:
