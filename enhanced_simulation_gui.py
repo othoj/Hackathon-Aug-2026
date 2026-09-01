@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from heapq import heappush
+import math
 import subprocess
 import sys
 import threading
@@ -15,12 +16,15 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from ClassSetup import (
-    DEFAULT_MILP_INPUT_PATH,
+    MILP_BUCKET_MINUTES,
+    MILP_NUMBER_OF_BUCKETS,
     DEFAULT_MILP_RESULT_PATH,
     Batch,
     Order,
     Simulation,
+    add_manual_milp_order,
     build_simulation_inputs,
+    get_milp_orders,
     load_milp_result,
 )
 
@@ -164,36 +168,129 @@ class SimulationControlWindow:
 
     def show_add_order(self) -> None:
         self._clear(); self._page_title("Add order")
-        form = ttk.Frame(self.content); form.grid(row=1, column=0, sticky="nw")
-        route = tk.StringVar(value=self.templates[0].id)
+        form = ttk.Frame(self.content); form.grid(row=1, column=0, sticky="ew")
+        production_routes = [f"Route_Product_{product}" for product in range(1, 11)]
+        route = tk.StringVar(value=production_routes[0])
+        service_class = tk.StringVar(value="regular")
         wafers = tk.StringVar(value="25")
-        release = tk.StringVar(value=str(int(self.simulation.global_timer)))
+        earliest_bucket = max(
+            1,
+            math.ceil(self.simulation.global_timer / MILP_BUCKET_MINUTES),
+        )
+        release = tk.StringVar(value=str(earliest_bucket * MILP_BUCKET_MINUTES))
         priority = tk.StringVar(value="10")
-        fields = (("Product route", route), ("Wafers", wafers), ("Release time (minutes)", release), ("Priority", priority))
-        for row, (label, value) in enumerate(fields):
+
+        ttk.Label(form, text="Product route").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Combobox(
+            form,
+            textvariable=route,
+            values=production_routes,
+            state="readonly",
+            width=34,
+        ).grid(row=0, column=1, padx=10, pady=5, sticky="w")
+        ttk.Label(form, text="Service class").grid(row=1, column=0, sticky="w", pady=5)
+        service_box = ttk.Combobox(
+            form,
+            textvariable=service_class,
+            values=("regular", "hot"),
+            state="readonly",
+            width=16,
+        )
+        service_box.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+        for row, (label, value) in enumerate(
+            (
+                ("Wafers", wafers),
+                ("Release time (minutes)", release),
+                ("Priority", priority),
+            ),
+            start=2,
+        ):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=5)
-            if label == "Product route":
-                ttk.Combobox(form, textvariable=value, values=[item.id for item in self.templates], state="readonly", width=34).grid(row=row, column=1, padx=10, pady=5)
-            else:
-                ttk.Entry(form, textvariable=value, width=18).grid(row=row, column=1, sticky="w", padx=10, pady=5)
+            state = "readonly" if label == "Priority" else "normal"
+            ttk.Entry(form, textvariable=value, width=18, state=state).grid(
+                row=row, column=1, sticky="w", padx=10, pady=5
+            )
+
+        def update_priority(_event: object | None = None) -> None:
+            priority.set("20" if service_class.get() == "hot" else "10")
+
+        service_box.bind("<<ComboboxSelected>>", update_priority)
 
         def add() -> None:
             try:
                 template = next(item for item in self.templates if item.id == route.get())
+                quantity = int(wafers.get())
+                release_minutes = int(release.get())
+                if quantity <= 0:
+                    raise ValueError("Wafers must be positive")
+                if release_minutes % MILP_BUCKET_MINUTES:
+                    raise ValueError("Release time must be a multiple of 30 minutes")
+                time_bucket = release_minutes // MILP_BUCKET_MINUTES
+                if not 1 <= time_bucket < MILP_NUMBER_OF_BUCKETS:
+                    raise ValueError("Release time must be between 30 and 2370 minutes")
+                if release_minutes < self.simulation.global_timer:
+                    raise ValueError("Release time cannot precede the simulation clock")
+                is_hot = service_class.get() == "hot"
                 lot_id = f"{template.id}-manual-{self.simulation.total_batches + 1}"
-                batch = template.clone(lot_id=lot_id, number_of_wafers=int(wafers.get()),
-                    release_time=float(release.get()), priority=int(priority.get()))
-                if batch.release_time < self.simulation.global_timer:
-                    batch.release_time = self.simulation.global_timer
+                batch = template.clone(
+                    lot_id=lot_id,
+                    number_of_wafers=quantity,
+                    release_time=release_minutes,
+                    priority=20 if is_hot else 10,
+                    is_hot=is_hot,
+                )
+                add_manual_milp_order(
+                    product_number=int(route.get().removeprefix("Route_Product_")),
+                    service_class=service_class.get(),
+                    quantity=quantity,
+                    time_bucket=time_bucket,
+                )
                 self.simulation.add_batch(batch)
                 messagebox.showinfo(
                     "Order added",
                     f"Added {lot_id}. Use Build Schedule to run the MILP again.",
                 )
-                self.show_home()
-            except (StopIteration, ValueError) as error:
+                self.show_add_order()
+            except (OSError, StopIteration, ValueError) as error:
                 messagebox.showerror("Invalid order", str(error))
-        ttk.Button(form, text="Add order", command=add).grid(row=len(fields), column=1, sticky="w", padx=10, pady=14)
+        ttk.Button(form, text="Add order", command=add).grid(
+            row=5, column=1, sticky="w", padx=10, pady=14
+        )
+
+        order_frame = ttk.LabelFrame(self.content, text="MILP orders", padding=8)
+        order_frame.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        order_frame.columnconfigure(0, weight=1)
+        order_frame.rowconfigure(0, weight=1)
+        self.content.rowconfigure(2, weight=1)
+        columns = ("bucket", "release", "product", "class", "quantity", "priority", "source")
+        table = ttk.Treeview(order_frame, columns=columns, show="headings")
+        headings = ("Bucket", "Release (min)", "Product", "Class", "Wafers", "Priority", "Source")
+        for column, heading in zip(columns, headings):
+            table.heading(column, text=heading)
+            table.column(column, width=115, anchor="center")
+        scrollbar = ttk.Scrollbar(order_frame, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=scrollbar.set)
+        table.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        try:
+            orders = get_milp_orders()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Could not load MILP orders", str(error))
+            orders = ()
+        for order in orders:
+            table.insert(
+                "",
+                "end",
+                values=(
+                    order.time_bucket,
+                    order.release_minutes,
+                    f"Product {order.product_number}",
+                    order.service_class.title(),
+                    f"{order.quantity:g}",
+                    order.priority,
+                    order.source.title(),
+                ),
+            )
 
     def show_schedule(self) -> None:
         self._clear(); self._page_title("Access Schedule")
@@ -271,9 +368,6 @@ class SimulationControlWindow:
             "--results",
             str(DEFAULT_MILP_RESULT_PATH),
         ]
-        if DEFAULT_MILP_INPUT_PATH.exists():
-            command.extend(("--inputs", str(DEFAULT_MILP_INPUT_PATH)))
-
         def run() -> None:
             completed = subprocess.run(
                 command,

@@ -7,10 +7,10 @@ from itertools import count
 import json
 from pathlib import Path
 from random import Random
+from uuid import uuid4
 
 import pandas as pd
 
-2
 DEFAULT_XLSX_PATH = (
     Path(__file__).resolve().parent
     / "SMT2020"
@@ -30,9 +30,12 @@ ENGINEERING_RELEASE_OFFSETS = (8 * 60, 2 * 24 * 60 + 8 * 60)
 ENGINEERING_LOTS_PER_RELEASE = 40
 ENGINEERING_HOT_LOTS_PER_RELEASE = 8
 DEFAULT_RANDOM_SEED = 2020
-DEFAULT_MILP_INPUT_PATH = Path(__file__).resolve().parent / "milp_inputs.json"
+DEFAULT_MILP_ORDER_PATH = Path(__file__).resolve().parent / "milp_orders.json"
 DEFAULT_MILP_RESULT_PATH = Path(__file__).resolve().parent / "milp_results.json"
 MILP_RESULT_SCHEMA_VERSION = 1
+MILP_ORDER_SCHEMA_VERSION = 1
+MILP_BUCKET_MINUTES = 30
+MILP_NUMBER_OF_BUCKETS = 80
 REQUIRED_ROUTE_COLUMNS = {
     "STEP",
     "TOOLGROUP",
@@ -42,6 +45,162 @@ REQUIRED_ROUTE_COLUMNS = {
     "SETUP",
     "WHEN",
 }
+
+
+@dataclass(frozen=True)
+class MILPOrder:
+    """One generated or manually entered first-step arrival for the MILP."""
+
+    id: str
+    product_number: int
+    service_class: str
+    quantity: float
+    time_bucket: int
+    priority: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.product_number <= 10:
+            raise ValueError("MILP order product_number must be between 1 and 10")
+        if self.service_class not in {"regular", "hot"}:
+            raise ValueError("MILP order service_class must be 'regular' or 'hot'")
+        if self.quantity <= 0:
+            raise ValueError("MILP order quantity must be positive")
+        if not 1 <= self.time_bucket < MILP_NUMBER_OF_BUCKETS:
+            raise ValueError("MILP orders must be released in buckets 1 through 79")
+        expected_priority = 20 if self.service_class == "hot" else 10
+        if self.priority != expected_priority:
+            raise ValueError(
+                f"{self.service_class} orders must have priority {expected_priority}"
+            )
+        if self.source not in {"generated", "manual"}:
+            raise ValueError("MILP order source must be 'generated' or 'manual'")
+
+    @property
+    def route_id(self) -> str:
+        return f"{ROUTE_SHEET_PREFIX}{self.product_number}"
+
+    @property
+    def flow_id(self) -> str:
+        return f"{self.route_id}|{self.service_class}"
+
+    @property
+    def release_minutes(self) -> int:
+        return self.time_bucket * MILP_BUCKET_MINUTES
+
+
+def build_default_milp_orders() -> tuple[MILPOrder, ...]:
+    """Return the fixed 80-bucket recurring production order schedule."""
+
+    orders: list[MILPOrder] = []
+
+    def add(product: int, time_bucket: int, service_class: str = "regular") -> None:
+        orders.append(
+            MILPOrder(
+                id=f"generated-p{product}-{service_class}-t{time_bucket}",
+                product_number=product,
+                service_class=service_class,
+                quantity=200.0,
+                time_bucket=time_bucket,
+                priority=20 if service_class == "hot" else 10,
+                source="generated",
+            )
+        )
+
+    for time_bucket in range(16, MILP_NUMBER_OF_BUCKETS, 16):
+        for product in range(1, 5):
+            service_class = (
+                "hot" if product == 2 and time_bucket == 16 else "regular"
+            )
+            add(product, time_bucket, service_class)
+    for time_bucket in range(6, MILP_NUMBER_OF_BUCKETS, 16):
+        for product in range(5, 8):
+            add(product, time_bucket)
+    for time_bucket in range(12, MILP_NUMBER_OF_BUCKETS, 16):
+        for product in range(8, 11):
+            add(product, time_bucket)
+    return tuple(sorted(orders, key=_milp_order_sort_key))
+
+
+def _milp_order_sort_key(order: MILPOrder) -> tuple[int, int, str, str]:
+    return (
+        order.time_bucket,
+        order.product_number,
+        order.service_class,
+        order.id,
+    )
+
+
+def load_manual_milp_orders(
+    path: Path | str = DEFAULT_MILP_ORDER_PATH,
+) -> tuple[MILPOrder, ...]:
+    """Load manually entered orders; a missing file means no manual orders."""
+
+    source = Path(path)
+    if not source.exists():
+        return ()
+    document = json.loads(source.read_text(encoding="utf-8"))
+    version = int(document.get("schema_version", 0))
+    if version != MILP_ORDER_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported MILP order schema {version}; "
+            f"expected {MILP_ORDER_SCHEMA_VERSION}"
+        )
+    orders = tuple(MILPOrder(**record) for record in document.get("orders", []))
+    if any(order.source != "manual" for order in orders):
+        raise ValueError("The manual-order file may contain only manual orders")
+    return tuple(sorted(orders, key=_milp_order_sort_key))
+
+
+def save_manual_milp_orders(
+    orders: tuple[MILPOrder, ...] | list[MILPOrder],
+    path: Path | str = DEFAULT_MILP_ORDER_PATH,
+) -> Path:
+    """Atomically persist manual orders shared by the GUI and MILP process."""
+
+    if any(order.source != "manual" for order in orders):
+        raise ValueError("Only manual orders may be saved to the manual-order file")
+    destination = Path(path)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    payload = {
+        "schema_version": MILP_ORDER_SCHEMA_VERSION,
+        "orders": [asdict(order) for order in sorted(orders, key=_milp_order_sort_key)],
+    }
+    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.replace(destination)
+    return destination
+
+
+def add_manual_milp_order(
+    product_number: int,
+    service_class: str,
+    quantity: float,
+    time_bucket: int,
+    path: Path | str = DEFAULT_MILP_ORDER_PATH,
+) -> MILPOrder:
+    """Append one validated manual order to the persisted order schedule."""
+
+    order = MILPOrder(
+        id=f"manual-{uuid4().hex}",
+        product_number=product_number,
+        service_class=service_class,
+        quantity=float(quantity),
+        time_bucket=time_bucket,
+        priority=20 if service_class == "hot" else 10,
+        source="manual",
+    )
+    orders = [*load_manual_milp_orders(path), order]
+    save_manual_milp_orders(orders, path)
+    return order
+
+
+def get_milp_orders(
+    path: Path | str = DEFAULT_MILP_ORDER_PATH,
+) -> tuple[MILPOrder, ...]:
+    """Return generated and persisted manual orders in chronological order."""
+
+    orders = [*build_default_milp_orders(), *load_manual_milp_orders(path)]
+    return tuple(sorted(orders, key=_milp_order_sort_key))
 
 
 @dataclass(frozen=True)
@@ -368,6 +527,7 @@ class Step:
         setup_id: str | None = None,
         setup_when: str | None = None,
         route_step: int | None = None,
+        processing_unit: str | None = None,
     ):
         self.tool_group_needed = tool_group_needed
         self.time_needed = float(time_needed)
@@ -375,6 +535,7 @@ class Step:
         self.setup_id = setup_id
         self.setup_when = setup_when
         self.route_step = route_step
+        self.processing_unit = processing_unit
 
     @property
     def tool_group(self) -> str:
@@ -384,6 +545,19 @@ class Step:
     def setup_is_always_required(self) -> bool:
         return self.setup_when == "always"
 
+    @property
+    def processing_time_per_wafer(self) -> float:
+        """Return PT in minutes/wafer using the route row's processing unit."""
+
+        divisors = {"wafer": 1.0, "lot": 25.0, "batch": 200.0}
+        unit = (self.processing_unit or "").strip().lower()
+        if unit not in divisors:
+            raise ValueError(
+                f"Unsupported processing unit {self.processing_unit!r}; "
+                "expected Wafer, Lot, or Batch"
+            )
+        return self.time_needed / divisors[unit]
+
     def clone(self) -> Step:
         return Step(
             self.tool_group_needed,
@@ -391,6 +565,7 @@ class Step:
             self.setup_id,
             self.setup_when,
             self.route_step,
+            self.processing_unit,
         )
 
 
@@ -545,6 +720,7 @@ def build_batch_templates(
                         setup_when.lower() if setup_when is not None else None
                     ),
                     route_step=int(row["STEP"]),
+                    processing_unit=str(row["PROCESSING UNIT"]).strip(),
                 )
             )
         if steps:
