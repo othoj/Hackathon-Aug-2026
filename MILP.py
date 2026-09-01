@@ -769,12 +769,8 @@ def _name(prefix: str, *parts: Any) -> str:
     return f"{prefix}[{','.join(cleaned)}]"
 
 
-def solve_model(milp: MILPModel) -> int:
-    """Optimize a built model and print a compact status/solution summary."""
-
-    milp.model.optimize()
-    status = milp.model.Status
-    status_name = {
+def _status_name(status: int) -> str:
+    return {
         GRB.LOADED: "LOADED",
         GRB.OPTIMAL: "OPTIMAL",
         GRB.INFEASIBLE: "INFEASIBLE",
@@ -783,18 +779,115 @@ def solve_model(milp: MILPModel) -> int:
         GRB.TIME_LIMIT: "TIME_LIMIT",
         GRB.INTERRUPTED: "INTERRUPTED",
     }.get(status, str(status))
-    print(f"Solver status: {status_name}")
-    if milp.model.SolCount:
-        print(f"Objective value: {milp.model.ObjVal:.6g}")
-        print(f"Total changeovers started: {sum(var.X > 0.5 for var in milp.c.values())}")
+
+
+def extract_result(milp: MILPModel) -> ClassSetup.MILPResult:
+    """Convert Gurobi values into ClassSetup's chronological schedule schema."""
+
+    has_solution = bool(milp.model.SolCount)
+    events: list[ClassSetup.MILPScheduleEvent] = []
+    total_completed: float | None = None
+    final_queue: float | None = None
+    objective: float | None = None
+    mip_gap: float | None = None
+
+    if has_solution:
+        objective = float(milp.model.ObjVal)
+        mip_gap = float(milp.model.MIPGap)
+        bucket_minutes = milp.data.config.bucket_minutes
+        for (flow, step, group, machine, time), variable in milp.x.items():
+            if variable.X <= 1e-6:
+                continue
+            start_minute = float(time * bucket_minutes)
+            events.append(
+                ClassSetup.MILPScheduleEvent(
+                    time_bucket=time,
+                    start_minute=start_minute,
+                    end_minute=start_minute + bucket_minutes,
+                    event_type="PROCESS",
+                    group=group,
+                    machine=machine,
+                    flow_id=flow,
+                    route_step=step,
+                    quantity=float(variable.X),
+                )
+            )
+        for (group, machine, old_setup, new_setup, time), variable in milp.c.items():
+            if variable.X <= 0.5:
+                continue
+            duration_buckets = math.ceil(
+                milp.data.setup_times_minutes[(group, old_setup, new_setup)]
+                / bucket_minutes
+            )
+            start_minute = float(time * bucket_minutes)
+            events.append(
+                ClassSetup.MILPScheduleEvent(
+                    time_bucket=time,
+                    start_minute=start_minute,
+                    end_minute=start_minute + duration_buckets * bucket_minutes,
+                    event_type="SETUP",
+                    group=group,
+                    machine=machine,
+                    from_setup=old_setup,
+                    to_setup=new_setup,
+                )
+            )
+        events.sort(
+            key=lambda event: (
+                event.time_bucket,
+                0 if event.event_type == "SETUP" else 1,
+                event.group,
+                event.machine,
+                event.route_step or -1,
+            )
+        )
+        total_completed = sum(
+            variable.X
+            for flow in milp.data.flows.values()
+            for variable in (
+                milp.x[(flow.id, flow.operations[-1].step, flow.operations[-1].group, machine, time)]
+                for machine in (
+                    key[1]
+                    for key in milp.data.machines
+                    if key[0] == flow.operations[-1].group
+                )
+                for time in milp.data.times
+            )
+        )
         final_time = milp.data.config.number_of_buckets - 1
         final_queue = sum(
             variable.X
             for (flow, step, time), variable in milp.q.items()
             if time == final_time
         )
-        print(f"Queue remaining after {milp.data.config.horizon_hours} hours: {final_queue:.6g}")
-    return status
+
+    return ClassSetup.MILPResult(
+        status=_status_name(milp.model.Status),
+        has_solution=has_solution,
+        objective=objective,
+        runtime_seconds=float(milp.model.Runtime),
+        mip_gap=mip_gap,
+        bucket_minutes=milp.data.config.bucket_minutes,
+        horizon_hours=milp.data.config.horizon_hours,
+        total_arrivals=sum(milp.data.arrivals.values()),
+        total_completed=total_completed,
+        final_queue=final_queue,
+        events=tuple(events),
+    )
+
+
+def solve_model(
+    milp: MILPModel,
+    result_path: Path | str = ClassSetup.DEFAULT_MILP_RESULT_PATH,
+) -> ClassSetup.MILPResult:
+    """Optimize, print the ordered schedule, and persist it for the GUI."""
+
+    milp.model.optimize()
+    result = extract_result(milp)
+    print(ClassSetup.format_milp_result(result))
+    saved_path = ClassSetup.save_milp_result(result, result_path)
+    print(f"\nSchedule saved to: {saved_path}")
+    return result
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -803,6 +896,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--xlsx", type=Path, default=ClassSetup.DEFAULT_XLSX_PATH)
     parser.add_argument("--time-limit", type=float)
     parser.add_argument("--mip-gap", type=float)
+    parser.add_argument(
+        "--results",
+        type=Path,
+        default=ClassSetup.DEFAULT_MILP_RESULT_PATH,
+        help="JSON schedule read by enhanced_simulation_gui.py",
+    )
     parser.add_argument("--quiet", action="store_true", help="disable Gurobi console logging")
     return parser.parse_args(argv)
 
@@ -827,8 +926,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         milp = build_model(data, inputs)
-        status = solve_model(milp)
-        return 0 if milp.model.SolCount else 3
+        result = solve_model(milp, args.results)
+        return 0 if result.has_solution else 3
     except (
         KeyError,
         TypeError,

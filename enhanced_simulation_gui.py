@@ -8,10 +8,21 @@ from __future__ import annotations
 
 from collections import deque
 from heapq import heappush
+import subprocess
+import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from ClassSetup import Batch, Order, Simulation, build_simulation_inputs
+from ClassSetup import (
+    DEFAULT_MILP_INPUT_PATH,
+    DEFAULT_MILP_RESULT_PATH,
+    Batch,
+    Order,
+    Simulation,
+    build_simulation_inputs,
+    load_milp_result,
+)
 
 
 SIMULATED_MINUTES_PER_SECOND = 60
@@ -85,6 +96,8 @@ class SimulationControlWindow:
         self._status_text = tk.StringVar()
         self._completed_text = tk.StringVar()
         self._activity_text = tk.StringVar()
+        self._build_in_progress = False
+        self._build_status_text = tk.StringVar(value="No MILP build is running.")
         self.content = ttk.Frame(root, padding=18)
         self.content.grid(sticky="nsew")
         root.columnconfigure(0, weight=1)
@@ -120,16 +133,23 @@ class SimulationControlWindow:
         buttons = (
             ("Completed jobs", self.show_completed_jobs),
             ("Add order", self.show_add_order),
-            ("Create schedule", self.show_schedule),
+            ("Build Schedule", self.build_schedule),
+            ("Access Schedule", self.show_schedule),
             ("Simulate", self.show_simulation),
             ("Breakdowns", self.show_breakdowns),
         )
         menu = ttk.Frame(self.content)
         menu.grid(row=2, column=0)
         for row, (label, command) in enumerate(buttons):
-            ttk.Button(menu, text=label, command=command, width=28).grid(
+            button = ttk.Button(menu, text=label, command=command, width=28)
+            button.grid(
                 row=row, column=0, pady=5, sticky="ew"
             )
+            if label == "Build Schedule" and self._build_in_progress:
+                button.state(["disabled"])
+        ttk.Label(self.content, textvariable=self._build_status_text).grid(
+            row=3, column=0, pady=(12, 0)
+        )
 
     def show_completed_jobs(self) -> None:
         self._clear(); self._page_title("Completed jobs")
@@ -166,21 +186,127 @@ class SimulationControlWindow:
                 if batch.release_time < self.simulation.global_timer:
                     batch.release_time = self.simulation.global_timer
                 self.simulation.add_batch(batch)
-                messagebox.showinfo("Order added", f"Added {lot_id}.")
-                self.show_schedule()
+                messagebox.showinfo(
+                    "Order added",
+                    f"Added {lot_id}. Use Build Schedule to run the MILP again.",
+                )
+                self.show_home()
             except (StopIteration, ValueError) as error:
                 messagebox.showerror("Invalid order", str(error))
         ttk.Button(form, text="Add order", command=add).grid(row=len(fields), column=1, sticky="w", padx=10, pady=14)
 
     def show_schedule(self) -> None:
-        self._clear(); self._page_title("Schedule")
-        ttk.Label(self.content, text="Lots are shown in their release order. Use Add order to change the schedule.").grid(row=1, column=0, sticky="w", pady=(0, 8))
-        table = self._table(("release", "lot", "route", "priority", "status"), row=2)
-        self._headings(table, ("Release", "Lot", "Route", "Priority", "Status"))
-        batches = [batch for order in self.simulation.orders for batch in order.batches]
-        for batch in sorted(batches, key=lambda item: (item.release_time, item.lot_id)):
-            status = "Completed" if batch.finished else ("Released" if batch.release_time <= self.simulation.global_timer else "Planned")
-            table.insert("", "end", values=(f"{batch.release_time:.1f}", batch.lot_id, batch.id, batch.priority, status))
+        self._clear(); self._page_title("Access Schedule")
+        controls = ttk.Frame(self.content)
+        controls.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(
+            controls,
+            text=f"MILP result: {DEFAULT_MILP_RESULT_PATH.name}",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(controls, text="Refresh", command=self.show_schedule).grid(
+            row=0, column=1, padx=12
+        )
+        try:
+            result = load_milp_result(missing_ok=True)
+        except (OSError, ValueError) as error:
+            ttk.Label(
+                self.content,
+                text=f"Could not read the saved MILP schedule: {error}",
+            ).grid(row=2, column=0, sticky="w")
+            return
+        if result is None:
+            ttk.Label(
+                self.content,
+                text="No MILP schedule has been saved. Use Build Schedule first.",
+            ).grid(row=2, column=0, sticky="w")
+            return
+
+        summary = ttk.LabelFrame(self.content, text="MILP summary", padding=10)
+        summary.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        for row, line in enumerate(result.summary_lines()):
+            ttk.Label(summary, text=line).grid(row=row, column=0, sticky="w")
+
+        frame = ttk.Frame(self.content)
+        frame.grid(row=3, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        self.content.rowconfigure(3, weight=1)
+        columns = ("time", "type", "machine", "details")
+        table = ttk.Treeview(frame, columns=columns, show="headings")
+        headings = ("Start time", "Event", "Tool", "Processing or setup details")
+        widths = (150, 90, 220, 430)
+        for column, heading, width in zip(columns, headings, widths):
+            table.heading(column, text=heading)
+            table.column(column, width=width, anchor="w")
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=table.xview)
+        table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        table.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        for event in result.events:
+            table.insert(
+                "",
+                "end",
+                values=(
+                    f"{event.start_minute:.1f} min (t={event.time_bucket})",
+                    event.event_type.title(),
+                    f"{event.group} / machine {event.machine}",
+                    event.details,
+                ),
+            )
+
+    def build_schedule(self) -> None:
+        """Run MILP.py without blocking Tk's event loop."""
+
+        if self._build_in_progress:
+            return
+        self._build_in_progress = True
+        self._build_status_text.set("Building MILP schedule...")
+        self.show_home()
+        command = [
+            sys.executable,
+            str(DEFAULT_MILP_RESULT_PATH.parent / "MILP.py"),
+            "--quiet",
+            "--results",
+            str(DEFAULT_MILP_RESULT_PATH),
+        ]
+        if DEFAULT_MILP_INPUT_PATH.exists():
+            command.extend(("--inputs", str(DEFAULT_MILP_INPUT_PATH)))
+
+        def run() -> None:
+            completed = subprocess.run(
+                command,
+                cwd=DEFAULT_MILP_RESULT_PATH.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            output = "\n".join(
+                part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
+            )
+            self.root.after(
+                0,
+                lambda: self._finish_schedule_build(completed.returncode, output),
+            )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _finish_schedule_build(self, return_code: int, output: str) -> None:
+        self._build_in_progress = False
+        if output:
+            print(output)
+        if return_code == 0:
+            self._build_status_text.set("MILP schedule built successfully.")
+            messagebox.showinfo("Schedule built", "The MILP schedule is ready.")
+            self.show_schedule()
+            return
+        self._build_status_text.set(f"MILP build failed with exit code {return_code}.")
+        self.show_home()
+        messagebox.showerror(
+            "Schedule build failed",
+            output[-3000:] if output else f"MILP.py exited with code {return_code}.",
+        )
 
     def show_breakdowns(self) -> None:
         self._clear(); self._page_title("Machine breakdowns")

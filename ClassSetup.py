@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import asdict, dataclass
 from heapq import heappop, heappush
 from itertools import count
+import json
 from pathlib import Path
 from random import Random
 
@@ -28,6 +30,9 @@ ENGINEERING_RELEASE_OFFSETS = (8 * 60, 2 * 24 * 60 + 8 * 60)
 ENGINEERING_LOTS_PER_RELEASE = 40
 ENGINEERING_HOT_LOTS_PER_RELEASE = 8
 DEFAULT_RANDOM_SEED = 2020
+DEFAULT_MILP_INPUT_PATH = Path(__file__).resolve().parent / "milp_inputs.json"
+DEFAULT_MILP_RESULT_PATH = Path(__file__).resolve().parent / "milp_results.json"
+MILP_RESULT_SCHEMA_VERSION = 1
 REQUIRED_ROUTE_COLUMNS = {
     "STEP",
     "TOOLGROUP",
@@ -37,6 +42,117 @@ REQUIRED_ROUTE_COLUMNS = {
     "SETUP",
     "WHEN",
 }
+
+
+@dataclass(frozen=True)
+class MILPScheduleEvent:
+    """One nonzero processing assignment or setup start from a MILP solution."""
+
+    time_bucket: int
+    start_minute: float
+    event_type: str
+    group: str
+    machine: int
+    end_minute: float
+    flow_id: str | None = None
+    route_step: int | None = None
+    quantity: float | None = None
+    from_setup: str | None = None
+    to_setup: str | None = None
+
+    @property
+    def details(self) -> str:
+        if self.event_type == "PROCESS":
+            return (
+                f"{self.flow_id}, step {self.route_step}: "
+                f"{self.quantity:.6g} wafers"
+            )
+        return (
+            f"{self.from_setup} -> {self.to_setup} "
+            f"(ends at {self.end_minute:.1f} min)"
+        )
+
+
+@dataclass(frozen=True)
+class MILPResult:
+    """Serializable solver summary and chronological production schedule."""
+
+    status: str
+    has_solution: bool
+    objective: float | None
+    runtime_seconds: float
+    mip_gap: float | None
+    bucket_minutes: int
+    horizon_hours: int
+    total_arrivals: float
+    total_completed: float | None
+    final_queue: float | None
+    events: tuple[MILPScheduleEvent, ...] = ()
+    schema_version: int = MILP_RESULT_SCHEMA_VERSION
+
+    def summary_lines(self) -> tuple[str, ...]:
+        objective = "n/a" if self.objective is None else f"{self.objective:.6g}"
+        completed = (
+            "n/a" if self.total_completed is None else f"{self.total_completed:.6g}"
+        )
+        final_queue = "n/a" if self.final_queue is None else f"{self.final_queue:.6g}"
+        gap = "n/a" if self.mip_gap is None else f"{100 * self.mip_gap:.3g}%"
+        return (
+            f"Status: {self.status}",
+            f"Objective: {objective}",
+            f"Runtime: {self.runtime_seconds:.2f} seconds | MIP gap: {gap}",
+            f"Arrivals: {self.total_arrivals:.6g} wafers | Completed: {completed}",
+            f"Final queue: {final_queue} wafers | Schedule events: {len(self.events):,}",
+        )
+
+
+def save_milp_result(
+    result: MILPResult,
+    path: Path | str = DEFAULT_MILP_RESULT_PATH,
+) -> Path:
+    """Atomically save a MILP result for the GUI and other clients."""
+
+    destination = Path(path)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+    temporary.replace(destination)
+    return destination
+
+
+def load_milp_result(
+    path: Path | str = DEFAULT_MILP_RESULT_PATH,
+    *,
+    missing_ok: bool = False,
+) -> MILPResult | None:
+    """Load and validate the schedule written by ``MILP.py``."""
+
+    source = Path(path)
+    if missing_ok and not source.exists():
+        return None
+    document = json.loads(source.read_text(encoding="utf-8"))
+    version = int(document.get("schema_version", 0))
+    if version != MILP_RESULT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported MILP result schema {version}; "
+            f"expected {MILP_RESULT_SCHEMA_VERSION}"
+        )
+    events = tuple(MILPScheduleEvent(**event) for event in document.pop("events", []))
+    return MILPResult(events=events, **document)
+
+
+def format_milp_result(result: MILPResult) -> str:
+    """Return a human-readable summary and time-ordered schedule."""
+
+    lines = ["MILP RESULTS", *result.summary_lines(), "", "SCHEDULE"]
+    if not result.events:
+        lines.append("No processing or setup events were produced.")
+    for event in result.events:
+        machine = f"{event.group}/{event.machine}"
+        lines.append(
+            f"T+{event.start_minute:08.1f} min | {event.event_type:7} | "
+            f"{machine:30} | {event.details}"
+        )
+    return "\n".join(lines)
 
 
 class ToolGroup:
