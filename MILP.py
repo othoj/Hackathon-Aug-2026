@@ -439,7 +439,7 @@ def validate_inputs(data: ModelData, inputs: MILPInputs) -> ValidationReport:
             total_backup = sum(
                 inputs.backup_machines[(group, state)]
                 for state in states
-                if state != ClassSetup.DEFAULT_STATE_IDMinimize weighted queues using ClassSetup priorities: regular weight 10 and hot weight 20.
+                if state != ClassSetup.DEFAULT_STATE_ID
             )
             if total_backup > number_of_machines:
                 report.add(
