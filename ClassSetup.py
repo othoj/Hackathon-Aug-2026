@@ -4,12 +4,11 @@ from collections import deque
 from heapq import heappop, heappush
 from itertools import count
 from pathlib import Path
+from random import Random
 
 import pandas as pd
 
-from get_routes_for_products import PROCESSING_UNIT_MULTIPLIERS
-
-
+2
 DEFAULT_XLSX_PATH = (
     Path(__file__).resolve().parent
     / "SMT2020"
@@ -20,7 +19,15 @@ DEFAULT_XLSX_PATH = (
 )
 DEFAULT_STATE_ID = "default"
 ROUTE_SHEET_PREFIX = "Route_Product_"
-BATCHES_PER_ORDER = 200
+MINUTES_PER_WEEK = 7 * 24 * 60
+DEFAULT_RELEASE_HORIZON_MINUTES = MINUTES_PER_WEEK
+PRODUCTION_REGULAR_RELEASE_INTERVAL = MINUTES_PER_WEEK / 39
+PRODUCTION_HOT_RELEASE_INTERVAL = MINUTES_PER_WEEK
+PRODUCTION_WAFERS_PER_LOT = 25
+ENGINEERING_RELEASE_OFFSETS = (8 * 60, 2 * 24 * 60 + 8 * 60)
+ENGINEERING_LOTS_PER_RELEASE = 40
+ENGINEERING_HOT_LOTS_PER_RELEASE = 8
+DEFAULT_RANDOM_SEED = 2020
 REQUIRED_ROUTE_COLUMNS = {
     "STEP",
     "TOOLGROUP",
@@ -128,17 +135,42 @@ class Machine:
 
 
 class Batch:
-    """A single item progressing through one product route."""
+    """One wafer lot progressing through a product route.
 
-    def __init__(self, id: str, steps: list[Step]):
+    The class name is retained for compatibility, but an instance represents
+    one production or engineering lot, not a diffusion-machine batch.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        steps: list[Step],
+        *,
+        lot_id: str | None = None,
+        number_of_wafers: int = PRODUCTION_WAFERS_PER_LOT,
+        release_time: float = 0.0,
+        priority: int = 10,
+        is_hot: bool = False,
+        is_engineering: bool = False,
+    ):
         if not steps:
             raise ValueError("A batch must contain at least one step")
+        if number_of_wafers <= 0:
+            raise ValueError("number_of_wafers must be positive")
+        if release_time < 0:
+            raise ValueError("release_time cannot be negative")
         self.id = id
+        self.lot_id = lot_id if lot_id is not None else id
         self.steps = steps
         self.current_step_index = 0
         self.total_number_of_steps = len(steps)
         self.finished = False
         self.time_stamp = 0.0
+        self.number_of_wafers = int(number_of_wafers)
+        self.release_time = float(release_time)
+        self.priority = int(priority)
+        self.is_hot = is_hot
+        self.is_engineering = is_engineering
 
     @property
     def current_step(self) -> Step | None:
@@ -154,6 +186,12 @@ class Batch:
     def timestamp(self) -> float:
         return self.time_stamp
 
+    @property
+    def cycle_time(self) -> float | None:
+        if not self.finished:
+            return None
+        return self.time_stamp - self.release_time
+
     def mark_current_step_completed(self, time_completed_at: float) -> None:
         step = self.current_step
         if step is None:
@@ -165,9 +203,36 @@ class Batch:
         else:
             self.current_step_index += 1
 
-    def clone(self) -> Batch:
-        return Batch(self.id, [step.clone() for step in self.steps])
-
+    def clone(
+        self,
+        *,
+        lot_id: str | None = None,
+        number_of_wafers: int | None = None,
+        release_time: float | None = None,
+        priority: int | None = None,
+        is_hot: bool | None = None,
+        is_engineering: bool | None = None,
+    ) -> Batch:
+        return Batch(
+            self.id,
+            [step.clone() for step in self.steps],
+            lot_id=lot_id if lot_id is not None else self.lot_id,
+            number_of_wafers=(
+                self.number_of_wafers
+                if number_of_wafers is None
+                else number_of_wafers
+            ),
+            release_time=(
+                self.release_time if release_time is None else release_time
+            ),
+            priority=self.priority if priority is None else priority,
+            is_hot=self.is_hot if is_hot is None else is_hot,
+            is_engineering=(
+                self.is_engineering
+                if is_engineering is None
+                else is_engineering
+            ),
+        )
 
 class Order:
     """A collection of batches which all follow the same product route."""
@@ -332,10 +397,8 @@ def build_tool_groups(
 
 
 def _processing_time_in_minutes(row: pd.Series) -> float:
-    processing_unit = str(row["PROCESSING UNIT"]).strip().lower()
-    if processing_unit not in PROCESSING_UNIT_MULTIPLIERS:
-        raise ValueError(f"Unknown processing unit: {processing_unit!r}")
-    return float(row["MEAN"]) * PROCESSING_UNIT_MULTIPLIERS[processing_unit]
+    """Use the worksheet time directly, without wafer or lot multipliers."""
+    return float(row["MEAN"])
 
 
 def build_batch_templates(
@@ -373,24 +436,131 @@ def build_batch_templates(
     return templates
 
 
+def _release_times(interval: float, horizon: float) -> list[float]:
+    release_times: list[float] = []
+    release_time = 0.0
+    while release_time < horizon - 1e-9:
+        release_times.append(release_time)
+        release_time += interval
+    return release_times
+
+
+def _production_lots(template: Batch, horizon: float) -> list[Batch]:
+    product_number = template.id.removeprefix(ROUTE_SHEET_PREFIX)
+    lots: list[Batch] = []
+    for lot_number, release_time in enumerate(
+        _release_times(PRODUCTION_REGULAR_RELEASE_INTERVAL, horizon), 1
+    ):
+        lots.append(
+            template.clone(
+                lot_id=f"Regular_Lot_{product_number}_{lot_number}",
+                number_of_wafers=PRODUCTION_WAFERS_PER_LOT,
+                release_time=release_time,
+                priority=10,
+                is_hot=False,
+                is_engineering=False,
+            )
+        )
+    for lot_number, release_time in enumerate(
+        _release_times(PRODUCTION_HOT_RELEASE_INTERVAL, horizon), 1
+    ):
+        lots.append(
+            template.clone(
+                lot_id=f"HotLot_{product_number}_{lot_number}",
+                number_of_wafers=PRODUCTION_WAFERS_PER_LOT,
+                release_time=release_time,
+                priority=20,
+                is_hot=True,
+                is_engineering=False,
+            )
+        )
+    return sorted(lots, key=lambda lot: lot.release_time)
+
+
+def _engineering_lots_by_route(
+    templates_by_id: dict[str, Batch],
+    horizon: float,
+    random_seed: int,
+) -> dict[str, list[Batch]]:
+    route_ids = [f"{ROUTE_SHEET_PREFIX}E{i}" for i in range(1, 4)]
+    lots_by_route = {route_id: [] for route_id in route_ids}
+    lot_numbers = {route_id: 0 for route_id in route_ids}
+    hot_lot_numbers = {route_id: 0 for route_id in route_ids}
+    random = Random(random_seed)
+    week_number = 0
+
+    while week_number * MINUTES_PER_WEEK < horizon:
+        week_start = week_number * MINUTES_PER_WEEK
+        for release_index, release_offset in enumerate(
+            ENGINEERING_RELEASE_OFFSETS
+        ):
+            release_time = week_start + release_offset
+            if release_time >= horizon:
+                continue
+            for index in range(ENGINEERING_LOTS_PER_RELEASE):
+                route_index = (
+                    week_number * 2 * ENGINEERING_LOTS_PER_RELEASE
+                    + release_index * ENGINEERING_LOTS_PER_RELEASE
+                    + index
+                ) % len(route_ids)
+                route_id = route_ids[route_index]
+                template = templates_by_id[route_id]
+                is_hot = index < ENGINEERING_HOT_LOTS_PER_RELEASE
+                counters = hot_lot_numbers if is_hot else lot_numbers
+                counters[route_id] += 1
+                product_number = route_id.removeprefix(
+                    f"{ROUTE_SHEET_PREFIX}E"
+                )
+                lot_type = (
+                    "Engineering_HotLot" if is_hot else "Engineering_Lot"
+                )
+                lots_by_route[route_id].append(
+                    template.clone(
+                        lot_id=(
+                            f"{lot_type}_{product_number}_"
+                            f"{counters[route_id]}"
+                        ),
+                        number_of_wafers=random.randint(1, 10),
+                        release_time=release_time,
+                        priority=20 if is_hot else 10,
+                        is_hot=is_hot,
+                        is_engineering=True,
+                    )
+                )
+        week_number += 1
+    return lots_by_route
+
+
 def build_orders(
     batch_templates: list[Batch],
-    batches_per_order: int = BATCHES_PER_ORDER,
+    release_horizon_minutes: float = DEFAULT_RELEASE_HORIZON_MINUTES,
+    random_seed: int = DEFAULT_RANDOM_SEED,
 ) -> list[Order]:
-    """Create one order containing identical copies of each route template."""
-    if batches_per_order <= 0:
-        raise ValueError("batches_per_order must be positive")
-    return [
-        Order(
-            template.id,
-            [template.clone() for _ in range(batches_per_order)],
-        )
-        for template in batch_templates
-    ]
+    """Create dataset-4 production and engineering lot releases.
+
+    Production lots follow the workbook constant release intervals.
+    Engineering lots are released Monday and Wednesday at 08:00, total 80
+    per complete week, with 20 percent hot lots and 1--10 wafers.
+    """
+    if release_horizon_minutes <= 0:
+        raise ValueError("release_horizon_minutes must be positive")
+
+    templates_by_id = {template.id: template for template in batch_templates}
+    engineering_lots = _engineering_lots_by_route(
+        templates_by_id, release_horizon_minutes, random_seed
+    )
+    orders: list[Order] = []
+    for template in batch_templates:
+        if template.id.startswith(f"{ROUTE_SHEET_PREFIX}E"):
+            lots = engineering_lots[template.id]
+        else:
+            lots = _production_lots(template, release_horizon_minutes)
+        orders.append(Order(template.id, lots))
+    return orders
 
 
 class Simulation:
-    """Discrete-event scheduler for the configured machines and orders."""
+    """Discrete-event scheduler for the configured machines and lot releases."""
 
     def __init__(self, tool_groups: list[ToolGroup], orders: list[Order]):
         self.tool_groups = {group.id: group for group in tool_groups}
@@ -406,10 +576,11 @@ class Simulation:
             for group_id, group in self.tool_groups.items()
         }
         self._busy: list[tuple[float, int, Machine]] = []
+        self._releases: list[tuple[float, int, Batch]] = []
         self._event_ids = count()
-        self._load_initial_batches()
+        self._load_release_events()
 
-    def _load_initial_batches(self) -> None:
+    def _load_release_events(self) -> None:
         for order in self.orders:
             for batch in order.batches:
                 step = batch.current_step
@@ -421,7 +592,21 @@ class Simulation:
                         f"Unknown tool group {step.tool_group_needed!r} "
                         f"in batch {batch.id!r}"
                     )
-                self._ready[step.tool_group_needed].append(batch)
+                heappush(
+                    self._releases,
+                    (batch.release_time, next(self._event_ids), batch),
+                )
+
+    def _release_lots(self) -> set[str]:
+        affected_tool_groups: set[str] = set()
+        while self._releases and self._releases[0][0] <= self.global_timer:
+            _, _, batch = heappop(self._releases)
+            step = batch.current_step
+            if step is None:
+                continue
+            self._ready[step.tool_group_needed].append(batch)
+            affected_tool_groups.add(step.tool_group_needed)
+        return affected_tool_groups
 
     def _setup_machine_for_step(
         self,
@@ -480,13 +665,14 @@ class Simulation:
         return affected_tool_groups
 
     def run(self) -> float:
-        """Run until every batch is finished and return elapsed minutes."""
-        for tool_group_id in self.tool_groups:
-            self._dispatch(tool_group_id)
-
-        while self._busy:
-            self.global_timer = self._busy[0][0]
-            affected_tool_groups: set[str] = set()
+        """Release scheduled lots, drain them, and return elapsed minutes."""
+        while self._busy or self._releases:
+            next_completion = self._busy[0][0] if self._busy else float("inf")
+            next_release = (
+                self._releases[0][0] if self._releases else float("inf")
+            )
+            self.global_timer = min(next_completion, next_release)
+            affected_tool_groups = self._release_lots()
             while self._busy and self._busy[0][0] <= self.global_timer:
                 _, _, machine = heappop(self._busy)
                 affected_tool_groups.update(self._complete_machine(machine))
@@ -510,24 +696,33 @@ def simulate(tool_groups: list[ToolGroup], orders: list[Order]) -> float:
 
 def build_simulation_inputs(
     xlsx_path: Path | str = DEFAULT_XLSX_PATH,
-    batches_per_order: int = BATCHES_PER_ORDER,
+    release_horizon_minutes: float = DEFAULT_RELEASE_HORIZON_MINUTES,
+    random_seed: int = DEFAULT_RANDOM_SEED,
 ) -> tuple[list[Batch], list[Order], list[ToolGroup]]:
-    """Build templates, orders, and tool groups with one workbook read."""
+    """Build templates, scheduled orders, and tool groups."""
     path = Path(xlsx_path)
     route_pages = _read_route_pages(path)
     tool_groups = build_tool_groups(path, route_pages)
     batch_templates = build_batch_templates(path, route_pages)
-    orders = build_orders(batch_templates, batches_per_order)
+    orders = build_orders(
+        batch_templates, release_horizon_minutes, random_seed
+    )
     return batch_templates, orders, tool_groups
 
 
 def main(
     run_simulation: bool = True,
+    release_horizon_minutes: float = DEFAULT_RELEASE_HORIZON_MINUTES,
+    random_seed: int = DEFAULT_RANDOM_SEED,
 ) -> tuple[list[Batch], list[Order], list[ToolGroup], Simulation]:
-    batch_templates, orders, tool_groups = build_simulation_inputs()
+    batch_templates, orders, tool_groups = build_simulation_inputs(
+        release_horizon_minutes=release_horizon_minutes,
+        random_seed=random_seed,
+    )
     simulation = Simulation(tool_groups, orders)
     if run_simulation:
         simulation.run()
+    print(simulation.global_timer)
     return batch_templates, orders, tool_groups, simulation
 
 

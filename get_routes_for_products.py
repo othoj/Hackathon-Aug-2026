@@ -15,8 +15,8 @@ EXCEL_PATH = (
 )
 
 PROCESSING_UNIT_MULTIPLIERS = {
-    "wafer": 100,
-    "lot": 4,
+    "wafer": 1,
+    "lot": 1,
     "batch": 1,
 }
 
