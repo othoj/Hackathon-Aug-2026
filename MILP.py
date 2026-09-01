@@ -1,12 +1,14 @@
 """Aggregate-flow semiconductor digital twin implemented with Gurobi.
 
-The factory structure and release schedule come from :mod:`ClassSetup`.  Four
+The factory structure and release schedule come from :mod:`ClassSetup`.  Three
 optimization-specific input families are deliberately not guessed:
 
 * initial queue/WIP by flow and route step;
 * per-machine processing capacity by flow and route step;
-* minimum backup machines by tool group and setup;
 * the initial setup of every physical machine.
+
+The backup minimum ``B`` defaults to one machine for every non-default setup
+state.  A JSON input may override individual values when testing alternatives.
 
 Running this file without an input JSON file prints a compact report of those
 missing values and exits before a Gurobi model is created.  The JSON format is
@@ -57,6 +59,7 @@ QKey = tuple[str, int, int]
 ZKey = tuple[str, int, str, int]
 UKey = tuple[str, int, int]
 CKey = tuple[str, int, str, str, int]
+DEFAULT_BACKUP_MINIMUM = 1
 
 
 @dataclass(frozen=True)
@@ -96,7 +99,7 @@ class MILPConfig:
 
 @dataclass
 class MILPInputs:
-    """Parameters which are not defined by ``ClassSetup`` or its workbook."""
+    """Parameters absent from the workbook, plus optional B overrides."""
 
     initial_queue: dict[FlowStepKey, float] = field(default_factory=dict)
     processing_capacity: dict[FlowStepKey, float] = field(default_factory=dict)
@@ -386,12 +389,13 @@ def validate_inputs(data: ModelData, inputs: MILPInputs) -> ValidationReport:
         flow_steps,
         inputs.processing_capacity,
     )
-    _report_key_coverage(
-        report,
-        "B / backup_machines",
-        backup_keys,
-        inputs.backup_machines,
-    )
+    unknown_backup = sorted(inputs.backup_machines.keys() - backup_keys)
+    if unknown_backup:
+        report.add(
+            "unknown B / backup_machines",
+            f"{len(unknown_backup)} supplied keys are not modeled",
+            unknown_backup,
+        )
     _report_key_coverage(
         report,
         "Z0 / initial_setup",
@@ -435,20 +439,19 @@ def validate_inputs(data: ModelData, inputs: MILPInputs) -> ValidationReport:
 
     for group, states in data.states.items():
         number_of_machines = sum(1 for machine in machine_keys if machine[0] == group)
-        if all((group, state) in inputs.backup_machines for state in states if state != ClassSetup.DEFAULT_STATE_ID):
-            total_backup = sum(
-                inputs.backup_machines[(group, state)]
-                for state in states
-                if state != ClassSetup.DEFAULT_STATE_ID
+        total_backup = sum(
+            _backup_minimum(inputs, (group, state))
+            for state in states
+            if state != ClassSetup.DEFAULT_STATE_ID
+        )
+        if total_backup > number_of_machines:
+            report.add(
+                "infeasible backup totals",
+                f"{group!r} requires {total_backup} states but has {number_of_machines} machines",
+                [(group, state) for state in states if state != ClassSetup.DEFAULT_STATE_ID],
             )
-            if total_backup > number_of_machines:
-                report.add(
-                    "infeasible backup totals",
-                    f"{group!r} requires {total_backup} states but has {number_of_machines} machines",
-                    [(group, state) for state in states if state != ClassSetup.DEFAULT_STATE_ID],
-                )
 
-    if machine_keys <= inputs.initial_setup.keys() and backup_keys <= inputs.backup_machines.keys():
+    if machine_keys <= inputs.initial_setup.keys():
         initial_counts: dict[GroupSetupKey, int] = defaultdict(int)
         for (group, _machine), state in inputs.initial_setup.items():
             if (group, _machine) in machine_keys and state in data.states[group]:
@@ -456,7 +459,7 @@ def validate_inputs(data: ModelData, inputs: MILPInputs) -> ValidationReport:
         unmet = sorted(
             key
             for key in backup_keys
-            if initial_counts[key] < inputs.backup_machines[key]
+            if initial_counts[key] < _backup_minimum(inputs, key)
         )
         if unmet:
             report.add(
@@ -491,6 +494,12 @@ def _report_key_coverage(
         report.add(label, f"{len(missing)} required values are missing", missing)
     if extra:
         report.add(f"unknown {label}", f"{len(extra)} supplied keys are not modeled", extra)
+
+
+def _backup_minimum(inputs: MILPInputs, key: GroupSetupKey) -> int:
+    """Return an explicit B override or the requested default of one."""
+
+    return inputs.backup_machines.get(key, DEFAULT_BACKUP_MINIMUM)
 
 
 def build_model(data: ModelData, inputs: MILPInputs) -> MILPModel:
@@ -743,7 +752,7 @@ def _add_setup_constraints(
                 )
 
     for group, setup in sorted(data.required_backup_keys):
-        minimum = inputs.backup_machines[(group, setup)]
+        minimum = _backup_minimum(inputs, (group, setup))
         for time in data.times:
             model.addConstr(
                 gp.quicksum(
@@ -814,7 +823,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(report.format())
             print(
                 "\nStill undefined: Q0 initial WIP, PC per-bucket capacities, "
-                "B backup minima, and Z0 initial machine setups."
+                "and Z0 initial machine setups. B defaults to 1."
             )
             return 2
         milp = build_model(data, inputs)
